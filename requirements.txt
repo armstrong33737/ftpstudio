@@ -1,8 +1,14 @@
-# Interface graphique moderne
+# Interface graphique moderne & moteur d'image
 customtkinter>=5.2.2
+Pillow>=10.0.0
 
-# Outil de compilation multiplateforme (exécutables Linux, Windows, macOS)
+# Outil de compilation multiplateforme
 pyinstaller>=6.10.0
 
-# Serveur FTP asynchrone embarqué
+# Serveurs réseau & protocoles
 pyftpdlib>=2.0.0
+zeroconf
+
+# QR Code mobile & Barre d'état (Systray)
+qrcode
+pystray
