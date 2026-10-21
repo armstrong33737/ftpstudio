@@ -1,3 +1,0 @@
-selection multiple
-icon par type de document
-bouton retour bug
