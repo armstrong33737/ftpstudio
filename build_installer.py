@@ -1,7 +1,7 @@
 """
 build_installer.py
 ==================
-Compilation ultra-légère multi-OS de FTPStudio.
+Compilation ultra-légère multi-OS de FTPStudio avec support du mode serveur.
 Exécution : python build_installer.py
 """
 
@@ -31,6 +31,7 @@ def build():
         "--windowed",
         "--name", APP_NAME,
         "--collect-all", "customtkinter",
+        "--collect-all", "pyftpdlib",
         ENTRY_POINT
     ]
 

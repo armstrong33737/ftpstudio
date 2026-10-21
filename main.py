@@ -1,8 +1,8 @@
 """
 main.py
 =======
-FTPStudio - Détection réseau et ouverture dans l'explorateur natif de l'OS.
-Architecture autonome en fichier unique (Linux, Windows, macOS).
+FTPStudio - Détection réseau, client OS et serveur FTP embarqué.
+Projet autonome en fichier unique multi-OS (Linux, Windows, macOS).
 """
 
 import ipaddress
@@ -16,13 +16,19 @@ import threading
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from tkinter import filedialog, messagebox
 from typing import Callable, List, Optional, Tuple
 
-# Suppression préventive du message parasite appmenu-gtk sous Linux/Ubuntu
+# Suppression préventive du message parasite appmenu-gtk sous Linux
 os.environ["UBUNTU_MENUPROXY"] = "0"
 os.environ["NO_AT_BRIDGE"] = "1"
 
 import customtkinter as ctk
+
+# Serveur FTP embarqué
+from pyftpdlib.authorizers import DummyAuthorizer
+from pyftpdlib.handlers import FTPHandler
+from pyftpdlib.servers import ThreadedFTPServer
 
 
 # ==============================================================================
@@ -164,13 +170,7 @@ def build_remote_url(ip: str, port: int, protocol: str, user: Optional[str] = No
 def get_linux_file_manager() -> Optional[str]:
     """Détecte le gestionnaire de fichiers natif de la distribution Linux."""
     candidates = [
-        "nautilus",    # Ubuntu GNOME / Debian / Fedora
-        "dolphin",     # KDE Plasma
-        "nemo",        # Linux Mint / Cinnamon
-        "thunar",      # XFCE
-        "caja",        # MATE
-        "pcmanfm-qt",  # LXQt
-        "pcmanfm"      # LXDE
+        "nautilus", "dolphin", "nemo", "thunar", "caja", "pcmanfm-qt", "pcmanfm"
     ]
     for fm in candidates:
         if shutil.which(fm):
@@ -202,70 +202,39 @@ def open_in_native_file_manager(
     user: Optional[str] = None,
     password: Optional[str] = None
 ) -> Tuple[bool, str]:
-    """
-    Pilote l'ouverture directe dans le gestionnaire de fichiers système.
-    Anticipe les particularités et incompatibilités de Windows, macOS et Linux.
-    """
+    """Ouvre l'URL directement dans le gestionnaire de fichiers natif de l'OS."""
     target_url = build_remote_url(ip, port, protocol, user, password)
     system = platform.system()
 
     try:
-        # -------------------------------------------------------------
-        # CAS WINDOWS
-        # -------------------------------------------------------------
         if system == "Windows":
             if protocol.upper() == "SFTP":
-                # L'Explorateur Windows n'intègre pas de client SFTP natif
                 client_path = find_windows_sftp_client()
                 if client_path:
                     subprocess.Popen([client_path, target_url])
                     return True, f"SFTP ouvert avec {os.path.basename(client_path)}."
-
-                # Tentative avec le protocole système par défaut si un outil tiers est associé
                 try:
                     os.startfile(target_url)
                     return True, "Ouverture avec le gestionnaire SFTP associé."
                 except OSError:
-                    return False, (
-                        "Windows Explorer ne prend en charge nativement que le FTP.\n\n"
-                        "Pour ouvrir des liens SFTP en un clic, installez WinSCP ou FileZilla."
-                    )
+                    return False, "Windows Explorer ne supporte pas SFTP. Installez WinSCP ou FileZilla."
             else:
-                # Windows Explorer gère nativement le FTP
                 subprocess.Popen(["explorer.exe", target_url])
                 return True, "Explorateur Windows ouvert."
 
-        # -------------------------------------------------------------
-        # CAS MACOS (FINDER)
-        # -------------------------------------------------------------
-        elif system == "Darwin":
-            # open déclenche la boîte 'Se connecter au serveur' du Finder
-            res = subprocess.run(
-                ["open", target_url],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True
-            )
+        elif system == "Darwin":  # macOS
+            res = subprocess.run(["open", target_url], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             if res.returncode == 0:
                 return True, "Finder ouvert avec 'Se connecter au serveur'."
             else:
                 return False, f"Le Finder n'a pas pu monter l'URL ({res.stderr.strip()})."
 
-        # -------------------------------------------------------------
-        # CAS LINUX (GNOME, KDE, XFCE, MINT, ETC.)
-        # -------------------------------------------------------------
-        else:
-            # Appel direct de l'explorateur pour empêcher Opera/Chrome de capturer ftp://
+        else:  # Linux
             fm = get_linux_file_manager()
             if fm:
-                subprocess.Popen(
-                    [fm, target_url],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+                subprocess.Popen([fm, target_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return True, f"Explorateur ouvert ({fm})."
 
-            # Secours si aucun bureau standard n'est détecté
             if shutil.which("gio"):
                 subprocess.Popen(["gio", "open", target_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return True, "Explorateur ouvert via GIO."
@@ -278,7 +247,63 @@ def open_in_native_file_manager(
 
 
 # ==============================================================================
-# 3. INTERFACE UTILISATEUR (CUSTOMTKINTER)
+# 3. GESTIONNAIRE DU SERVEUR FTP EMBARQUÉ
+# ==============================================================================
+
+class EmbeddedFTPServer:
+    """Serveur FTP local asynchrone multithreadé."""
+
+    def __init__(self, folder: str, port: int = 2121, user: Optional[str] = None, password: Optional[str] = None, allow_write: bool = True):
+        self.folder = folder
+        self.port = port
+        self.user = user
+        self.password = password
+        self.allow_write = allow_write
+        self.server: Optional[ThreadedFTPServer] = None
+        self.is_running = False
+
+    def start(self):
+        authorizer = DummyAuthorizer()
+        # Droits : "elradfmwMT" (Écriture complète) ou "elr" (Lecture seule)
+        perm = "elradfmwMT" if self.allow_write else "elr"
+
+        if self.user and self.password:
+            authorizer.add_user(self.user, self.password, self.folder, perm=perm)
+        else:
+            authorizer.add_anonymous(self.folder, perm=perm)
+
+        handler = FTPHandler
+        handler.authorizer = authorizer
+        handler.banner = "FTPStudio Embedded Server ready."
+
+        # Écoute sur 0.0.0.0 (toutes les cartes réseau : WiFi, Ethernet, etc.)
+        self.server = ThreadedFTPServer(("0.0.0.0", self.port), handler)
+        self.server.max_cons = 64
+        self.server.max_cons_per_ip = 10
+
+        self.is_running = True
+        threading.Thread(target=self._run_loop, daemon=True).start()
+
+    def _run_loop(self):
+        try:
+            self.server.serve_forever()
+        except Exception:
+            pass
+        finally:
+            self.is_running = False
+
+    def stop(self):
+        if self.server:
+            try:
+                self.server.close_all()
+            except Exception:
+                pass
+            self.server = None
+        self.is_running = False
+
+
+# ==============================================================================
+# 4. INTERFACE GRAPHIQUE (CUSTOMTKINTER)
 # ==============================================================================
 
 class ManualConnectModal(ctk.CTkToplevel):
@@ -338,7 +363,6 @@ class ManualConnectModal(ctk.CTkToplevel):
         self.destroy()
         ok, msg = open_in_native_file_manager(ip, port, proto, user, pwd)
         if not ok:
-            from tkinter import messagebox
             messagebox.showerror("Erreur d'ouverture", msg)
 
 
@@ -347,9 +371,9 @@ class FTPStudioApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("FTPStudio - Explorateur Réseau Multi-OS")
-        self.geometry("820x580")
-        self.minsize(680, 460)
+        self.title("FTPStudio - Client & Serveur de Fichiers")
+        self.geometry("860x640")
+        self.minsize(720, 500)
 
         self.current_theme = "dark"
         ctk.set_appearance_mode(self.current_theme)
@@ -357,44 +381,76 @@ class FTPStudioApp(ctk.CTk):
 
         self.detected_servers: List[DetectedServer] = []
         self._is_scanning = False
+        self.embedded_server: Optional[EmbeddedFTPServer] = None
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(1, weight=1)
 
-        # 1. En-tête
+        # 1. En-tête global
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=22, pady=(16, 6))
+        header.grid(row=0, column=0, sticky="ew", padx=22, pady=(14, 2))
         header.grid_columnconfigure(0, weight=1)
 
         title_box = ctk.CTkFrame(header, fg_color="transparent")
         title_box.grid(row=0, column=0, sticky="w")
 
         ctk.CTkLabel(
-            title_box, text="🌐 FTPStudio", font=ctk.CTkFont(size=21, weight="bold")
+            title_box, text="🌐 FTPStudio", font=ctk.CTkFont(size=22, weight="bold")
         ).pack(side="left")
         ctk.CTkLabel(
-            title_box, text="  — Détection Réseau & Explorateur OS",
+            title_box, text="  — Détection Réseau, Client & Mode Serveur",
             font=ctk.CTkFont(size=13), text_color=("gray40", "gray70")
-        ).pack(side="left", pady=(5, 0))
+        ).pack(side="left", pady=(6, 0))
 
         self.theme_btn = ctk.CTkButton(
             header, text="🌙", width=38, height=32, command=self._toggle_theme
         )
         self.theme_btn.grid(row=0, column=1, sticky="e")
 
-        # 2. Panneau de commande
-        control_card = ctk.CTkFrame(self, corner_radius=10)
-        control_card.grid(row=1, column=0, sticky="ew", padx=22, pady=8)
+        # 2. Onglets : Client (Explorateur) & Serveur (Partage)
+        self.tabview = ctk.CTkTabview(self, corner_radius=10)
+        self.tabview.grid(row=1, column=0, sticky="nsew", padx=20, pady=(2, 8))
+
+        self.tab_client = self.tabview.add("🔍 Scanner & Explorateur")
+        self.tab_server = self.tabview.add("📁 Mode Serveur (Partager un dossier)")
+
+        self._build_client_tab()
+        self._build_server_tab()
+
+        # 3. Pied de page global
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=2, column=0, sticky="ew", padx=26, pady=(0, 8))
+        footer.grid_columnconfigure(0, weight=1)
+
+        self.status_lbl = ctk.CTkLabel(
+            footer, text=f"IP locale : {get_local_ip()} | Prêt.",
+            text_color=("gray40", "gray65"), font=ctk.CTkFont(size=12)
+        )
+        self.status_lbl.grid(row=0, column=0, sticky="w")
+
+    # ==========================================================================
+    # ONGLET 1 : CLIENT & SCANNER
+    # ==========================================================================
+    def _build_client_tab(self):
+        tab = self.tab_client
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        # Panneau de contrôle
+        control_card = ctk.CTkFrame(tab, corner_radius=10)
+        control_card.grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 8))
         control_card.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(control_card, text="Ports :", font=ctk.CTkFont(size=12, weight="bold")).grid(
             row=0, column=0, padx=(14, 6), pady=12, sticky="w"
         )
-        self.ports_entry = ctk.CTkEntry(control_card, width=140, height=30)
-        self.ports_entry.insert(0, "21, 22, 990")
+        self.ports_entry = ctk.CTkEntry(control_card, width=170, height=30)
+        # Inclusion de 2121 pour trouver immédiatement d'autres instances de FTPStudio
+        self.ports_entry.insert(0, "21, 22, 990, 2121")
         self.ports_entry.grid(row=0, column=1, sticky="w", pady=12)
 
         btn_box = ctk.CTkFrame(control_card, fg_color="transparent")
@@ -406,43 +462,27 @@ class FTPStudioApp(ctk.CTk):
         self.scan_btn.pack(side="left", padx=4)
 
         btn_manual = ctk.CTkButton(
-            btn_box, text="➕ Connexion manuelle...", height=32, width=150,
+            btn_box, text="➕ Manuel...", height=32, width=110,
             fg_color=("gray75", "gray25"), text_color=("black", "white"),
             command=lambda: ManualConnectModal(self)
         )
         btn_manual.pack(side="left", padx=4)
 
-        self.progress_bar = ctk.CTkProgressBar(self, height=4)
+        self.progress_bar = ctk.CTkProgressBar(tab, height=4)
         self.progress_bar.set(0)
-        self.progress_bar.grid(row=1, column=0, sticky="sew", padx=26, pady=0)
+        self.progress_bar.grid(row=0, column=0, sticky="sew", padx=14, pady=0)
 
-        # 3. Liste des serveurs
-        self.servers_scroll = ctk.CTkScrollableFrame(self, label_text="Serveurs détectés sur le réseau")
-        self.servers_scroll.grid(row=2, column=0, sticky="nsew", padx=22, pady=(10, 8))
+        # Liste scrollable des serveurs détectés
+        self.servers_scroll = ctk.CTkScrollableFrame(tab, label_text="Serveurs détectés sur le réseau")
+        self.servers_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(6, 6))
 
-        # 4. Pied de page
-        footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.grid(row=3, column=0, sticky="ew", padx=26, pady=(0, 10))
-        footer.grid_columnconfigure(0, weight=1)
-
-        self.status_lbl = ctk.CTkLabel(
-            footer, text=f"IP locale : {get_local_ip()} | Prêt à scanner.",
-            text_color=("gray40", "gray65"), font=ctk.CTkFont(size=12)
-        )
-        self.status_lbl.grid(row=0, column=0, sticky="w")
-
-        self._render_empty_state("Cliquez sur 'Scanner le réseau' pour lancer la détection.")
-
-    def _toggle_theme(self):
-        self.current_theme = "light" if self.current_theme == "dark" else "dark"
-        ctk.set_appearance_mode(self.current_theme)
-        self.theme_btn.configure(text="☀️" if self.current_theme == "light" else "🌙")
+        self._render_empty_state("Cliquez sur 'Scanner le réseau' pour détecter les serveurs.")
 
     def _render_empty_state(self, message: str):
         for w in self.servers_scroll.winfo_children():
             w.destroy()
         box = ctk.CTkFrame(self.servers_scroll, fg_color="transparent")
-        box.pack(expand=True, fill="both", pady=80)
+        box.pack(expand=True, fill="both", pady=70)
         ctk.CTkLabel(box, text="📡", font=ctk.CTkFont(size=44)).pack(pady=(0, 8))
         ctk.CTkLabel(
             box, text=message, font=ctk.CTkFont(size=13), text_color=("gray40", "gray65")
@@ -459,7 +499,7 @@ class FTPStudioApp(ctk.CTk):
             if p.isdigit() and 1 <= int(p) <= 65535:
                 ports.append(int(p))
         if not ports:
-            ports = [21, 22, 990]
+            ports = [21, 22, 990, 2121]
 
         self._is_scanning = True
         self.scan_btn.configure(state="disabled", text="Scan en cours...")
@@ -541,14 +581,223 @@ class FTPStudioApp(ctk.CTk):
                 self, default_ip=server.ip, default_port=server.port, default_proto=server.protocol
             )
         else:
-            ok, msg = open_in_native_file_manager(
-                ip=server.ip, port=server.port, protocol=server.protocol
-            )
+            ok, msg = open_in_native_file_manager(ip=server.ip, port=server.port, protocol=server.protocol)
             if not ok:
-                from tkinter import messagebox
                 messagebox.showerror("Erreur", msg)
             else:
                 self.status_lbl.configure(text=f"Explorateur ouvert pour {server.ip}:{server.port}")
+
+    # ==========================================================================
+    # ONGLET 2 : MODE SERVEUR EMBARQUÉ (PARTAGE)
+    # ==========================================================================
+    def _build_server_tab(self):
+        tab = self.tab_server
+        tab.grid_columnconfigure(0, weight=1)
+
+        # 1. Sélection du dossier
+        dir_card = ctk.CTkFrame(tab, corner_radius=10)
+        dir_card.pack(fill="x", padx=14, pady=(12, 8))
+        dir_card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(dir_card, text="Dossier partagé :", font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=0, column=0, padx=14, pady=12, sticky="w"
+        )
+
+        default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.exists(default_dir):
+            default_dir = os.path.expanduser("~")
+
+        self.server_dir_entry = ctk.CTkEntry(dir_card)
+        self.server_dir_entry.insert(0, default_dir)
+        self.server_dir_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=12)
+
+        btn_browse = ctk.CTkButton(
+            dir_card, text="📁 Parcourir...", width=100, command=self._choose_server_dir
+        )
+        btn_browse.grid(row=0, column=2, padx=(4, 14), pady=12)
+
+        # 2. Options de configuration
+        opts_card = ctk.CTkFrame(tab, corner_radius=10)
+        opts_card.pack(fill="x", padx=14, pady=8)
+        opts_card.grid_columnconfigure(1, weight=1)
+
+        # Port
+        ctk.CTkLabel(opts_card, text="Port d'écoute :", font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=0, column=0, padx=14, pady=8, sticky="w"
+        )
+        self.server_port_entry = ctk.CTkEntry(opts_card, width=120)
+        self.server_port_entry.insert(0, "2121")
+        self.server_port_entry.grid(row=0, column=1, sticky="w", padx=8, pady=8)
+
+        # Permissions d'écriture
+        self.write_perm_var = ctk.BooleanVar(value=True)
+        chk_write = ctk.CTkCheckBox(
+            opts_card, text="Autoriser l'écriture (Téléversement / Suppression par les clients)",
+            variable=self.write_perm_var
+        )
+        chk_write.grid(row=1, column=0, columnspan=2, padx=14, pady=8, sticky="w")
+
+        # Authentification
+        self.auth_mode_var = ctk.StringVar(value="anon")
+        auth_box = ctk.CTkFrame(opts_card, fg_color="transparent")
+        auth_box.grid(row=2, column=0, columnspan=2, padx=14, pady=8, sticky="w")
+
+        ctk.CTkRadioButton(
+            auth_box, text="Accès anonyme (Tous les appareils du réseau)",
+            variable=self.auth_mode_var, value="anon", command=self._toggle_auth_fields
+        ).pack(side="left", padx=(0, 20))
+
+        ctk.CTkRadioButton(
+            auth_box, text="Protection par mot de passe",
+            variable=self.auth_mode_var, value="auth", command=self._toggle_auth_fields
+        ).pack(side="left")
+
+        # Champs Utilisateur / Mot de passe (cachés par défaut)
+        self.auth_fields_frame = ctk.CTkFrame(opts_card, fg_color="transparent")
+        self.auth_fields_frame.grid(row=3, column=0, columnspan=2, padx=14, pady=(0, 10), sticky="ew")
+
+        ctk.CTkLabel(self.auth_fields_frame, text="Utilisateur :").pack(side="left", padx=(0, 6))
+        self.srv_user_entry = ctk.CTkEntry(self.auth_fields_frame, width=130)
+        self.srv_user_entry.insert(0, "user")
+        self.srv_user_entry.pack(side="left", padx=(0, 14))
+
+        ctk.CTkLabel(self.auth_fields_frame, text="Mot de passe :").pack(side="left", padx=(0, 6))
+        self.srv_pwd_entry = ctk.CTkEntry(self.auth_fields_frame, width=130, show="*")
+        self.srv_pwd_entry.insert(0, "1234")
+        self.srv_pwd_entry.pack(side="left")
+
+        self._toggle_auth_fields()
+
+        # 3. Bouton principal Démarrer / Arrêter
+        self.btn_toggle_server = ctk.CTkButton(
+            tab, text="▶ Démarrer le serveur", font=ctk.CTkFont(size=15, weight="bold"),
+            height=40, fg_color="#16a34a", hover_color="#15803d", command=self._toggle_server
+        )
+        self.btn_toggle_server.pack(fill="x", padx=14, pady=(10, 8))
+
+        # 4. Carte d'état en direct
+        self.server_status_card = ctk.CTkFrame(tab, corner_radius=10)
+        self.server_status_card.pack(fill="x", padx=14, pady=8)
+
+        self.lbl_server_state = ctk.CTkLabel(
+            self.server_status_card, text="🔴 Serveur arrêté",
+            font=ctk.CTkFont(size=14, weight="bold"), text_color=("gray40", "gray65")
+        )
+        self.lbl_server_state.pack(pady=(12, 4))
+
+        self.lbl_server_url = ctk.CTkLabel(
+            self.server_status_card, text="--",
+            font=ctk.CTkFont(size=18, weight="bold")
+        )
+        self.lbl_server_url.pack(pady=4)
+
+        self.server_actions_box = ctk.CTkFrame(self.server_status_card, fg_color="transparent")
+        self.server_actions_box.pack(pady=(4, 12))
+
+        self.btn_copy_url = ctk.CTkButton(
+            self.server_actions_box, text="📋 Copier le lien", width=120, height=28,
+            command=self._copy_server_url, state="disabled"
+        )
+        self.btn_copy_url.pack(side="left", padx=6)
+
+        self.btn_test_local = ctk.CTkButton(
+            self.server_actions_box, text="🚀 Ouvrir dans mon OS", width=160, height=28,
+            command=self._open_local_server_in_os, state="disabled"
+        )
+        self.btn_test_local.pack(side="left", padx=6)
+
+    def _choose_server_dir(self):
+        ch = filedialog.askdirectory(initialdir=self.server_dir_entry.get())
+        if ch:
+            self.server_dir_entry.delete(0, "end")
+            self.server_dir_entry.insert(0, ch)
+
+    def _toggle_auth_fields(self):
+        if self.auth_mode_var.get() == "auth":
+            self.auth_fields_frame.grid()
+        else:
+            self.auth_fields_frame.grid_remove()
+
+    def _toggle_server(self):
+        if self.embedded_server and self.embedded_server.is_running:
+            # Arrêt du serveur
+            self.embedded_server.stop()
+            self.embedded_server = None
+
+            self.btn_toggle_server.configure(
+                text="▶ Démarrer le serveur", fg_color="#16a34a", hover_color="#15803d"
+            )
+            self.lbl_server_state.configure(text="🔴 Serveur arrêté", text_color=("gray40", "gray65"))
+            self.lbl_server_url.configure(text="--")
+            self.btn_copy_url.configure(state="disabled")
+            self.btn_test_local.configure(state="disabled")
+            self.status_lbl.configure(text="Serveur FTP local arrêté.")
+        else:
+            # Démarrage du serveur
+            folder = self.server_dir_entry.get().strip()
+            if not os.path.exists(folder):
+                messagebox.showerror("Erreur", "Le dossier spécifié n'existe pas.")
+                return
+
+            port_raw = self.server_port_entry.get().strip()
+            port = int(port_raw) if port_raw.isdigit() else 2121
+
+            user = None
+            pwd = None
+            if self.auth_mode_var.get() == "auth":
+                user = self.srv_user_entry.get().strip() or "user"
+                pwd = self.srv_pwd_entry.get().strip() or "1234"
+
+            allow_w = self.write_perm_var.get()
+
+            try:
+                self.embedded_server = EmbeddedFTPServer(
+                    folder=folder, port=port, user=user, password=pwd, allow_write=allow_w
+                )
+                self.embedded_server.start()
+
+                local_ip = get_local_ip()
+                url = f"ftp://{local_ip}:{port}"
+
+                self.btn_toggle_server.configure(
+                    text="⏹ Arrêter le serveur", fg_color="#dc2626", hover_color="#b91c1c"
+                )
+                self.lbl_server_state.configure(
+                    text="🟢 Serveur actif et accessible sur le réseau !", text_color="#16a34a"
+                )
+                self.lbl_server_url.configure(text=url)
+                self.btn_copy_url.configure(state="normal")
+                self.btn_test_local.configure(state="normal")
+                self.status_lbl.configure(text=f"Serveur FTP actif sur {url} (Dossier : {folder})")
+
+            except Exception as e:
+                messagebox.showerror("Erreur", f"Impossible de démarrer le serveur :\n{e}")
+
+    def _copy_server_url(self):
+        url = self.lbl_server_url.cget("text")
+        if url and url != "--":
+            self.clipboard_clear()
+            self.clipboard_append(url)
+            messagebox.showinfo("Copié", f"Lien copié dans le presse-papier :\n{url}")
+
+    def _open_local_server_in_os(self):
+        if not self.embedded_server or not self.embedded_server.is_running:
+            return
+        local_ip = get_local_ip()
+        port = self.embedded_server.port
+        user = self.embedded_server.user
+        pwd = self.embedded_server.password
+        open_in_native_file_manager(ip=local_ip, port=port, protocol="FTP", user=user, password=pwd)
+
+    def _toggle_theme(self):
+        self.current_theme = "light" if self.current_theme == "dark" else "dark"
+        ctk.set_appearance_mode(self.current_theme)
+        self.theme_btn.configure(text="☀️" if self.current_theme == "light" else "🌙")
+
+    def _on_app_close(self):
+        if self.embedded_server and self.embedded_server.is_running:
+            self.embedded_server.stop()
+        self.destroy()
 
 
 if __name__ == "__main__":
