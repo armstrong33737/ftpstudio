@@ -4,7 +4,10 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
+  workflow_dispatch: # Permet de lancer la compilation manuellement depuis GitHub Actions
+
+permissions:
+  contents: write # Requis pour téléverser automatiquement les binaires sur GitHub Releases
 
 jobs:
   build:
@@ -25,30 +28,30 @@ jobs:
             asset_file: FTPStudio-macOS.zip
 
     steps:
-      - name: Checkout Code
+      - name: Récupération du code
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Configuration de Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
-      # Linux : installation de Tkinter
-      - name: Install System Dependencies (Linux)
+      # Linux : installation de Tkinter système
+      - name: Dépendances système (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-tk
 
-      # Installation des dépendances sans pymupdf (binaire allégé à ~26 Mo)
-      - name: Install Python Dependencies
+      # Installation des dépendances minimales (CustomTkinter + PyInstaller)
+      - name: Installation des dépendances Python
         run: |
           python -m pip install --upgrade pip
-          pip install customtkinter paramiko pyinstaller
+          pip install customtkinter pyinstaller
 
       # Build Linux (.tar.gz)
-      - name: Build Linux Binary
+      - name: Compilation binaire Linux
         if: runner.os == 'Linux'
         run: |
           pyinstaller --noconfirm --onedir --windowed \
@@ -58,7 +61,7 @@ jobs:
           tar -czf ${{ matrix.asset_file }} -C dist FTPStudio
 
       # Build Windows (.zip)
-      - name: Build Windows Binary
+      - name: Compilation binaire Windows
         if: runner.os == 'Windows'
         run: |
           pyinstaller --noconfirm --onedir --windowed `
@@ -68,27 +71,33 @@ jobs:
           Compress-Archive -Path dist/FTPStudio -DestinationPath ${{ matrix.asset_file }}
 
       # Build macOS (.zip)
-      - name: Build macOS Binary
+      - name: Compilation binaire macOS
         if: runner.os == 'macOS'
         run: |
           pyinstaller --noconfirm --onedir --windowed \
             --name "FTPStudio" \
             --collect-all customtkinter \
             main.py
-          cd dist && zip -r ../${{ matrix.asset_file }} FTPStudio.app || zip -r ../${{ matrix.asset_file }} FTPStudio
+          cd dist
+          if [ -d "FTPStudio.app" ]; then
+            zip -r ../${{ matrix.asset_file }} FTPStudio.app
+          else
+            zip -r ../${{ matrix.asset_file }} FTPStudio
+          fi
 
-      # Sauvegarde des livrables
-      - name: Upload Artifact
+      # 1. Sauvegarde des fichiers dans les Artifacts GitHub (téléchargeables immédiatement)
+      - name: Sauvegarde des livrables (Artifacts)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.asset_file }}
 
-      # Publication automatique sur GitHub Releases
-      - name: Publish to GitHub Release
+      # 2. Publication automatique sur GitHub Release lors d'un tag (ex: v1.0.0)
+      - name: Publication sur GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.asset_file }}
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
