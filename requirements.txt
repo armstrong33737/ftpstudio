@@ -1,0 +1,5 @@
+# Interface graphique moderne
+customtkinter>=5.2.2
+
+# Outil de compilation multiplateforme (exécutables Linux, Windows, macOS)
+pyinstaller>=6.10.0
